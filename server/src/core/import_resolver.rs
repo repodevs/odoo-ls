@@ -1,25 +1,26 @@
 use glob::glob;
 use lsp_types::{Diagnostic, DiagnosticTag, Position, Range};
 use ruff_python_ast::name::Name;
-use tracing::error;
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use tracing::error;
 
-use ruff_text_size::{TextRange, TextSize};
-use ruff_python_ast::{Alias, AtomicNodeIndex, Identifier};
-use crate::{constants::*, oyarn, Sy, S};
 use crate::core::diagnostics::{create_diagnostic, DiagnosticCode};
 use crate::threads::SessionInfo;
 use crate::utils::{is_dir_cs, is_file_cs, PathSanitizer};
+use crate::{constants::*, oyarn, Sy, S};
+use ruff_python_ast::{Alias, AtomicNodeIndex, Identifier};
+use ruff_text_size::{TextRange, TextSize};
 
 use super::entry_point::{EntryPoint, EntryPointType};
 use super::odoo::SyncOdoo;
 use super::symbols::symbol::Symbol;
 
 pub struct ImportResult {
-    pub name: OYarn, //the last imported element
+    pub name: OYarn,     //the last imported element
     pub var_name: OYarn, // the effective symbol name (asname, or first part in a import A.B.C)
     pub found: bool,
     pub symbols: Vec<Rc<RefCell<Symbol>>>,
@@ -35,25 +36,45 @@ pub struct ImportCache {
     pub main_modules: HashMap<OYarn, Option<Vec<Rc<RefCell<Symbol>>>>>,
 }
 
-fn resolve_import_stmt_hook(alias: &Alias, from_symbols: &Option<Vec<Rc<RefCell<Symbol>>>>, session: &mut SessionInfo, source_file_symbol: &Rc<RefCell<Symbol>>, from_stmt: Option<&Identifier>, level: u32, diagnostics: &mut Option<&mut Vec<Diagnostic>>) -> Option<ImportResult>{
-    if !(session.sync_odoo.version_major >= 17 && alias.name.as_str() == "Form"){
+fn resolve_import_stmt_hook(
+    alias: &Alias,
+    from_symbols: &Option<Vec<Rc<RefCell<Symbol>>>>,
+    session: &mut SessionInfo,
+    source_file_symbol: &Rc<RefCell<Symbol>>,
+    from_stmt: Option<&Identifier>,
+    level: u32,
+    diagnostics: &mut Option<&mut Vec<Diagnostic>>,
+) -> Option<ImportResult> {
+    if !(session.sync_odoo.version_major >= 17 && alias.name.as_str() == "Form") {
         return None;
     }
     for from_symbol in from_symbols.iter().flatten() {
         if from_symbol.borrow().get_main_entry_tree(session).0 != vec!["odoo", "tests", "common"] {
             continue;
         }
-        let mut results = resolve_import_stmt(session, source_file_symbol, Some(&Identifier::new(S!("odoo.tests"), from_stmt.unwrap().range)), &[alias.clone()], level, &mut None);
+        let mut results = resolve_import_stmt(
+            session,
+            source_file_symbol,
+            Some(&Identifier::new(S!("odoo.tests"), from_stmt.unwrap().range)),
+            &[alias.clone()],
+            level,
+            &mut None,
+        );
         if let Some(diagnostic) = diagnostics.as_mut() {
-            if let Some(diagnostic_base) = create_diagnostic(&session, DiagnosticCode::OLS03301, &[]) {
+            if let Some(diagnostic_base) =
+                create_diagnostic(&session, DiagnosticCode::OLS03301, &[])
+            {
                 diagnostic.push(Diagnostic {
-                    range: Range::new(Position::new(alias.range.start().to_u32(), 0), Position::new(alias.range.end().to_u32(), 0)),
+                    range: Range::new(
+                        Position::new(alias.range.start().to_u32(), 0),
+                        Position::new(alias.range.end().to_u32(), 0),
+                    ),
                     tags: Some(vec![DiagnosticTag::DEPRECATED]),
                     ..diagnostic_base
                 });
             }
         }
-        return results.pop()
+        return results.pop();
     }
     None
 }
@@ -61,34 +82,71 @@ fn resolve_import_stmt_hook(alias: &Alias, from_symbols: &Option<Vec<Rc<RefCell<
 /**
  * Helper to manually import a symbol. Do not forget to use level instead of '.' in the from_stmt parameter.
  */
-pub fn manual_import(session: &mut SessionInfo, source_file_symbol: &Rc<RefCell<Symbol>>, from_stmt:Option<String>, name: &str, asname: Option<String>, level: u32, diagnostics: &mut Option<&mut Vec<Diagnostic>>) -> Vec<ImportResult> {
+pub fn manual_import(
+    session: &mut SessionInfo,
+    source_file_symbol: &Rc<RefCell<Symbol>>,
+    from_stmt: Option<String>,
+    name: &str,
+    asname: Option<String>,
+    level: u32,
+    diagnostics: &mut Option<&mut Vec<Diagnostic>>,
+) -> Vec<ImportResult> {
     let name_aliases = vec![Alias {
-        name: Identifier { id: Name::new(name), range: TextRange::new(TextSize::new(0), TextSize::new(0)), node_index: AtomicNodeIndex::default() },
+        name: Identifier {
+            id: Name::new(name),
+            range: TextRange::new(TextSize::new(0), TextSize::new(0)),
+            node_index: AtomicNodeIndex::default(),
+        },
         asname: match asname {
-            Some(asname_inner) => Some(Identifier { id: Name::new(asname_inner), range: TextRange::new(TextSize::new(0), TextSize::new(0)), node_index: AtomicNodeIndex::default() }),
+            Some(asname_inner) => Some(Identifier {
+                id: Name::new(asname_inner),
+                range: TextRange::new(TextSize::new(0), TextSize::new(0)),
+                node_index: AtomicNodeIndex::default(),
+            }),
             None => None,
         },
         range: TextRange::new(TextSize::new(0), TextSize::new(0)),
-        node_index: AtomicNodeIndex::default()
+        node_index: AtomicNodeIndex::default(),
     }];
     let from_stmt = match from_stmt {
-        Some(from_stmt_inner) => Some(Identifier { id: Name::new(from_stmt_inner), range: TextRange::new(TextSize::new(0), TextSize::new(0)), node_index: AtomicNodeIndex::default() }),
+        Some(from_stmt_inner) => Some(Identifier {
+            id: Name::new(from_stmt_inner),
+            range: TextRange::new(TextSize::new(0), TextSize::new(0)),
+            node_index: AtomicNodeIndex::default(),
+        }),
         None => None,
     };
-    resolve_import_stmt(session, source_file_symbol, from_stmt.as_ref(), &name_aliases, level, diagnostics)
+    resolve_import_stmt(
+        session,
+        source_file_symbol,
+        from_stmt.as_ref(),
+        &name_aliases,
+        level,
+        diagnostics,
+    )
 }
 
 /// Resolve the base symbol from a from statement and level
 pub fn resolve_from_stmt(
-    session: &mut SessionInfo, source_file_symbol: &Rc<RefCell<Symbol>>, from_stmt: Option<&Identifier>, level: u32
-) -> (Option<Vec<Rc<RefCell<Symbol>>>>, Option<Vec<Rc<RefCell<Symbol>>>>, Vec<OYarn>) {
-    let source_root = source_file_symbol.borrow().get_root().as_ref().unwrap().upgrade().unwrap();
+    session: &mut SessionInfo,
+    source_file_symbol: &Rc<RefCell<Symbol>>,
+    from_stmt: Option<&Identifier>,
+    level: u32,
+) -> (
+    Option<Vec<Rc<RefCell<Symbol>>>>,
+    Option<Vec<Rc<RefCell<Symbol>>>>,
+    Vec<OYarn>,
+) {
+    let source_root = source_file_symbol
+        .borrow()
+        .get_root()
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .unwrap();
     let entry = source_root.borrow().get_entry().unwrap();
     let _source_file_symbol_lock = source_file_symbol.borrow_mut();
-    let file_tree = resolve_packages(
-        &_source_file_symbol_lock,
-        level,
-        from_stmt);
+    let file_tree = resolve_packages(&_source_file_symbol_lock, level, from_stmt);
     drop(_source_file_symbol_lock);
     let source_path = source_file_symbol.borrow().paths()[0].clone();
     let mut start_symbol = None;
@@ -96,31 +154,47 @@ pub fn resolve_from_stmt(
         //if level is *not* 0 (relative import), resolve_packages already built a full tree, so we can start from root
         start_symbol = Some(vec![source_root.clone()]);
     }
-    let (from_symbol, fallback_sym) = get_or_create_symbol(session,
+    let (from_symbol, fallback_sym) = get_or_create_symbol(
+        session,
         &entry,
         source_path.as_str(),
         start_symbol,
         &file_tree,
         None,
-        level);
+        level,
+    );
     let fallback_sym = Some(fallback_sym.unwrap_or(vec![source_root.clone()]));
     (from_symbol, fallback_sym, file_tree)
 }
 
-pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<RefCell<Symbol>>, from_stmt: Option<&Identifier>, name_aliases: &[Alias], level: u32, diagnostics: &mut Option<&mut Vec<Diagnostic>>) -> Vec<ImportResult> {
+pub fn resolve_import_stmt(
+    session: &mut SessionInfo,
+    source_file_symbol: &Rc<RefCell<Symbol>>,
+    from_stmt: Option<&Identifier>,
+    name_aliases: &[Alias],
+    level: u32,
+    diagnostics: &mut Option<&mut Vec<Diagnostic>>,
+) -> Vec<ImportResult> {
     //A: search base of different imports
-    let source_root = source_file_symbol.borrow().get_root().as_ref().unwrap().upgrade().unwrap();
+    let source_root = source_file_symbol
+        .borrow()
+        .get_root()
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .unwrap();
     let entry = source_root.borrow().get_entry().unwrap();
-    let (from_symbols, fallback_syms, file_tree) = resolve_from_stmt(session, source_file_symbol, from_stmt, level);
+    let (from_symbols, fallback_syms, file_tree) =
+        resolve_from_stmt(session, source_file_symbol, from_stmt, level);
     let mut result = vec![];
     for alias in name_aliases {
-        result.push(ImportResult{
+        result.push(ImportResult {
             name: OYarn::from(alias.name.as_ref().to_string()),
             var_name: OYarn::from(alias.asname.as_ref().unwrap_or(&alias.name).to_string()),
             found: false,
             symbols: fallback_syms.as_ref().unwrap().clone(),
             file_tree: file_tree.clone(),
-            range: alias.range.clone()
+            range: alias.range.clone(),
         })
     }
     if from_symbols.is_none() && from_stmt.is_some() {
@@ -131,7 +205,15 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
     for alias in name_aliases.iter() {
         let name = oyarn!("{}", alias.name);
         name_index += 1;
-        if let Some(hook_result) = resolve_import_stmt_hook(alias, &from_symbols.clone(), session, source_file_symbol, from_stmt, level,  diagnostics){
+        if let Some(hook_result) = resolve_import_stmt_hook(
+            alias,
+            &from_symbols.clone(),
+            session,
+            source_file_symbol,
+            from_stmt,
+            level,
+            diagnostics,
+        ) {
             result[name_index as usize] = hook_result;
             continue;
         }
@@ -143,7 +225,7 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
         let name_split: Vec<OYarn> = name.split(".").map(|s| oyarn!("{}", s)).collect();
         let name_first_part: Vec<OYarn> = vec![name_split.first().unwrap().clone()];
         let name_middle_part: Vec<OYarn> = if name_split.len() > 2 {
-            Vec::from_iter(name_split[1..name_split.len()-1].iter().cloned())
+            Vec::from_iter(name_split[1..name_split.len() - 1].iter().cloned())
         } else {
             vec![]
         };
@@ -156,14 +238,30 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
             from_symbols.clone(),
             &name_first_part,
             None,
-        0);
+            0,
+        );
         if next_symbol.is_none() && name_split.len() == 1 && from_symbols.is_some() {
             //check the last name is not a symbol in the file
-            let name_symbol_vec = from_symbols.as_ref().unwrap().iter().flat_map(|s| s.borrow().get_symbol(&(vec![], name_first_part.clone()), u32::MAX)).collect::<Vec<_>>();
-            next_symbol = if name_symbol_vec.len() > 0 {Some(name_symbol_vec.clone())} else {None};
+            let name_symbol_vec = from_symbols
+                .as_ref()
+                .unwrap()
+                .iter()
+                .flat_map(|s| {
+                    s.borrow()
+                        .get_symbol(&(vec![], name_first_part.clone()), u32::MAX)
+                })
+                .collect::<Vec<_>>();
+            next_symbol = if name_symbol_vec.len() > 0 {
+                Some(name_symbol_vec.clone())
+            } else {
+                None
+            };
         }
         if next_symbol.is_none() {
-            result[name_index as usize].symbols = fallback_sym.as_ref().unwrap_or(&vec![source_root.clone()]).clone();
+            result[name_index as usize].symbols = fallback_sym
+                .as_ref()
+                .unwrap_or(&vec![source_root.clone()])
+                .clone();
             continue;
         }
         if alias.asname.is_none() {
@@ -171,7 +269,8 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
             // In all "from X import A" case, it simply means search for A
             // But in "import A.B.C", it means search for A only, and import B.C
             // If user typed import A.B.C as D, we will search for A.B.C to link it to symbol D,
-            result[name_index as usize].var_name = name.split(".").map(|s| oyarn!("{}", s)).next().unwrap();
+            result[name_index as usize].var_name =
+                name.split(".").map(|s| oyarn!("{}", s)).next().unwrap();
             //result[name_index as usize].found = true; //even if found at this stage, we want to check everything anyway for diagnostics. But if found, we'll keep this symbol as imported
             result[name_index as usize].symbols = next_symbol.as_ref().unwrap().clone();
         }
@@ -183,11 +282,15 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
                 Some(next_symbol.as_ref().unwrap().clone()),
                 &name_middle_part,
                 None,
-            0);
+                0,
+            );
         }
         if next_symbol.is_none() {
             if alias.asname.is_some() {
-                result[name_index as usize].symbols = fallback_sym.as_ref().unwrap_or(&vec![source_root.clone()]).clone();
+                result[name_index as usize].symbols = fallback_sym
+                    .as_ref()
+                    .unwrap_or(&vec![source_root.clone()])
+                    .clone();
             }
             continue;
         }
@@ -200,14 +303,31 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
                 Some(next_symbol.as_ref().unwrap().clone()),
                 &name_last_name,
                 None,
-            0);
-            if last_symbol.is_none() { //If not a file/package, try to look up in symbols in current file (second parameter of get_symbol)
+                0,
+            );
+            if last_symbol.is_none() {
+                //If not a file/package, try to look up in symbols in current file (second parameter of get_symbol)
                 //TODO what if multiple values?
-                let name_symbol_vec = next_symbol.as_ref().unwrap().iter().flat_map(|s| s.borrow().get_symbol(&(vec![], name_last_name.clone()), u32::MAX)).collect::<Vec<_>>();
-                last_symbol = if name_symbol_vec.len() > 0 {Some(name_symbol_vec.clone())} else {None};
+                let name_symbol_vec = next_symbol
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| {
+                        s.borrow()
+                            .get_symbol(&(vec![], name_last_name.clone()), u32::MAX)
+                    })
+                    .collect::<Vec<_>>();
+                last_symbol = if name_symbol_vec.len() > 0 {
+                    Some(name_symbol_vec.clone())
+                } else {
+                    None
+                };
                 if last_symbol.is_none() {
                     if alias.asname.is_some() {
-                        result[name_index as usize].symbols = fallback_sym.as_ref().unwrap_or(&vec![source_root.clone()]).clone();
+                        result[name_index as usize].symbols = fallback_sym
+                            .as_ref()
+                            .unwrap_or(&vec![source_root.clone()])
+                            .clone();
                     }
                     continue;
                 }
@@ -221,7 +341,8 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
             }
         } else {
             //everything is ok, let's store the result if not already done
-            result[name_index as usize].name = name.split(".").map(|s| oyarn!("{}", s)).next().unwrap();
+            result[name_index as usize].name =
+                name.split(".").map(|s| oyarn!("{}", s)).next().unwrap();
             result[name_index as usize].found = true;
             result[name_index as usize].symbols = next_symbol.as_ref().unwrap().clone();
         }
@@ -230,17 +351,26 @@ pub fn resolve_import_stmt(session: &mut SessionInfo, source_file_symbol: &Rc<Re
     return result;
 }
 
-pub fn find_module(session: &mut SessionInfo, odoo_addons: Rc<RefCell<Symbol>>, name: &OYarn) -> Option<Rc<RefCell<Symbol>>> {
+pub fn find_module(
+    session: &mut SessionInfo,
+    odoo_addons: Rc<RefCell<Symbol>>,
+    name: &OYarn,
+) -> Option<Rc<RefCell<Symbol>>> {
     let paths = (*odoo_addons).borrow().paths().clone();
     for path in paths.iter() {
         let full_path = Path::new(path.as_str()).join(name.as_str());
         if !is_dir_cs(full_path.sanitize()) {
             continue;
         }
-        let Some(module_symbol) = Symbol::create_from_path(session, &full_path, odoo_addons.clone(), true) else {
+        let Some(module_symbol) =
+            Symbol::create_from_path(session, &full_path, odoo_addons.clone(), true)
+        else {
             continue;
         };
-        session.sync_odoo.modules.insert(name.clone(), Rc::downgrade(&module_symbol));
+        session
+            .sync_odoo
+            .modules
+            .insert(name.clone(), Rc::downgrade(&module_symbol));
         SyncOdoo::build_now(session, &module_symbol, BuildSteps::ARCH);
         return Some(module_symbol.clone());
     }
@@ -265,7 +395,8 @@ fn resolve_packages(from_file: &Symbol, level: u32, from_stmt: Option<&Identifie
                 error!("Level is too high and going out of scope");
                 first_part_tree = vec![];
             } else {
-                first_part_tree = Vec::from_iter(tree.0[0..tree.0.len()- lvl as usize].iter().cloned());
+                first_part_tree =
+                    Vec::from_iter(tree.0[0..tree.0.len() - lvl as usize].iter().cloned());
             }
         }
     }
@@ -275,15 +406,24 @@ fn resolve_packages(from_file: &Symbol, level: u32, from_stmt: Option<&Identifie
             for i in split {
                 first_part_tree.push(oyarn!("{}", i));
             }
-        },
-        None => ()
+        }
+        None => (),
     }
     first_part_tree
 }
 
 fn get_or_create_symbol(
-    session: &mut SessionInfo, for_entry: &Rc<RefCell<EntryPoint>>, from_path: &str, symbol: Option<Vec<Rc<RefCell<Symbol>>>>, names: &Vec<OYarn>, asname: Option<String>, level: u32
-) -> (Option<Vec<Rc<RefCell<Symbol>>>>, Option<Vec<Rc<RefCell<Symbol>>>>) {
+    session: &mut SessionInfo,
+    for_entry: &Rc<RefCell<EntryPoint>>,
+    from_path: &str,
+    symbol: Option<Vec<Rc<RefCell<Symbol>>>>,
+    names: &Vec<OYarn>,
+    asname: Option<String>,
+    level: u32,
+) -> (
+    Option<Vec<Rc<RefCell<Symbol>>>>,
+    Option<Vec<Rc<RefCell<Symbol>>>>,
+) {
     let mut syms = symbol.clone();
     let mut last_symbols = symbol.clone();
     for branch in names.iter() {
@@ -297,12 +437,24 @@ fn get_or_create_symbol(
             Some(ref symbols) => {
                 let mut next_symbol = vec![];
                 for s in symbols.iter() {
-                    let mut current_batch_symbol = s.borrow().get_symbol(&(vec![branch.clone()], vec![]), u32::MAX);
-                    if current_batch_symbol.is_empty() && matches!(s.borrow().typ(), SymType::ROOT | SymType::NAMESPACE | SymType::PACKAGE(_) | SymType::COMPILED | SymType::DISK_DIR) {
-                        current_batch_symbol = match resolve_new_symbol(session, s.clone(), &branch, asname.clone()) {
-                            Ok(v) => vec![v],
-                            Err(_) => vec![]
-                        }
+                    let mut current_batch_symbol = s
+                        .borrow()
+                        .get_symbol(&(vec![branch.clone()], vec![]), u32::MAX);
+                    if current_batch_symbol.is_empty()
+                        && matches!(
+                            s.borrow().typ(),
+                            SymType::ROOT
+                                | SymType::NAMESPACE
+                                | SymType::PACKAGE(_)
+                                | SymType::COMPILED
+                                | SymType::DISK_DIR
+                        )
+                    {
+                        current_batch_symbol =
+                            match resolve_new_symbol(session, s.clone(), &branch, asname.clone()) {
+                                Ok(v) => vec![v],
+                                Err(_) => vec![],
+                            }
                     }
                     next_symbol.extend(current_batch_symbol.clone());
                 }
@@ -312,12 +464,14 @@ fn get_or_create_symbol(
                 }
                 syms = Some(next_symbol.clone());
                 last_symbols = Some(next_symbol.clone());
-            },
+            }
             None => {
                 // Can we have sym None and level != 0 ? maybe on get_all_valid_names? tbc
                 if level == 0 {
                     if let Some(ref cache) = session.sync_odoo.import_cache {
-                        let cache_module = if for_entry.borrow().typ == EntryPointType::MAIN || for_entry.borrow().typ == EntryPointType::ADDON {
+                        let cache_module = if for_entry.borrow().typ == EntryPointType::MAIN
+                            || for_entry.borrow().typ == EntryPointType::ADDON
+                        {
                             cache.main_modules.get(branch)
                         } else {
                             cache.modules.get(branch)
@@ -339,17 +493,40 @@ fn get_or_create_symbol(
                 let mut found = false;
                 let entry_point_mgr = session.sync_odoo.entry_point_mgr.clone();
                 let entry_point_mgr = entry_point_mgr.borrow();
-                let from_path = session.sync_odoo.entry_point_mgr.borrow().transform_addon_path(&PathBuf::from(from_path));
+                let from_path = session
+                    .sync_odoo
+                    .entry_point_mgr
+                    .borrow()
+                    .transform_addon_path(&PathBuf::from(from_path));
                 let from_path = PathBuf::from(from_path);
                 for entry in entry_point_mgr.iter_for_import(for_entry) {
-                    if ((entry.borrow().is_public() && level == 0) || entry.borrow().is_valid_for(&from_path)) && entry.borrow().addon_to_odoo_path.is_none() {
+                    if ((entry.borrow().is_public() && level == 0)
+                        || entry.borrow().is_valid_for(&from_path))
+                        && entry.borrow().addon_to_odoo_path.is_none()
+                    {
                         let entry_point = entry.borrow().get_symbol();
                         if let Some(entry_point) = entry_point {
-                            let mut next_symbols = entry_point.borrow().get_symbol(&(vec![branch.clone()], vec![]), u32::MAX);
-                            if next_symbols.is_empty() && matches!(entry_point.borrow().typ(), SymType::ROOT | SymType::NAMESPACE | SymType::PACKAGE(_) | SymType::COMPILED | SymType::DISK_DIR) {
-                                next_symbols = match resolve_new_symbol(session, entry_point.clone(), &branch, asname.clone()) {
+                            let mut next_symbols = entry_point
+                                .borrow()
+                                .get_symbol(&(vec![branch.clone()], vec![]), u32::MAX);
+                            if next_symbols.is_empty()
+                                && matches!(
+                                    entry_point.borrow().typ(),
+                                    SymType::ROOT
+                                        | SymType::NAMESPACE
+                                        | SymType::PACKAGE(_)
+                                        | SymType::COMPILED
+                                        | SymType::DISK_DIR
+                                )
+                            {
+                                next_symbols = match resolve_new_symbol(
+                                    session,
+                                    entry_point.clone(),
+                                    &branch,
+                                    asname.clone(),
+                                ) {
                                     Ok(v) => vec![v],
-                                    Err(_) => vec![]
+                                    Err(_) => vec![],
                                 }
                             }
                             if next_symbols.is_empty() {
@@ -358,11 +535,18 @@ fn get_or_create_symbol(
                             if level == 0 {
                                 if entry.borrow().is_public() {
                                     if let Some(cache) = session.sync_odoo.import_cache.as_mut() {
-                                        cache.modules.insert(branch.clone(), Some(next_symbols.clone()));
+                                        cache
+                                            .modules
+                                            .insert(branch.clone(), Some(next_symbols.clone()));
                                     }
-                                } else if matches!(entry.borrow().typ, EntryPointType::MAIN | EntryPointType::ADDON) {
+                                } else if matches!(
+                                    entry.borrow().typ,
+                                    EntryPointType::MAIN | EntryPointType::ADDON
+                                ) {
                                     if let Some(cache) = session.sync_odoo.import_cache.as_mut() {
-                                        cache.main_modules.insert(branch.clone(), Some(next_symbols.clone()));
+                                        cache
+                                            .main_modules
+                                            .insert(branch.clone(), Some(next_symbols.clone()));
                                     }
                                 }
                             }
@@ -376,7 +560,9 @@ fn get_or_create_symbol(
                 if !found {
                     if for_entry.borrow().typ != EntryPointType::CUSTOM {
                         if let Some(cache) = session.sync_odoo.import_cache.as_mut() {
-                            if for_entry.borrow().typ == EntryPointType::MAIN || for_entry.borrow().typ == EntryPointType::ADDON {
+                            if for_entry.borrow().typ == EntryPointType::MAIN
+                                || for_entry.borrow().typ == EntryPointType::ADDON
+                            {
                                 cache.main_modules.insert(branch.clone(), None);
                             } else {
                                 cache.modules.insert(branch.clone(), None);
@@ -390,12 +576,17 @@ fn get_or_create_symbol(
             }
         }
     }
-    return (syms, last_symbols)
+    return (syms, last_symbols);
 }
 
 /// Resolve a new symbol from disk, creating it if found, or just creating a COMPILED symbol if a parent is COMPILED
 /// parent : parent symbol where to search, either ROOT, NAMESPACE, PACKAGE, COMPILED or DISK_DIR
-fn resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, imported_name: &OYarn, asname: Option<String>) -> Result<Rc<RefCell<Symbol>>, String> {
+fn resolve_new_symbol(
+    session: &mut SessionInfo,
+    parent: Rc<RefCell<Symbol>>,
+    imported_name: &OYarn,
+    asname: Option<String>,
+) -> Result<Rc<RefCell<Symbol>>, String> {
     if imported_name == "" {
         return Err("Empty name".to_string());
     }
@@ -405,11 +596,13 @@ fn resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, im
     }
     let sym_name: String = match asname {
         Some(asname_inner) => asname_inner.clone(),
-        None => imported_name.to_string()
+        None => imported_name.to_string(),
     };
     // COMPILED: we can only create a COMPILED symbol
     if (*parent).borrow().typ() == SymType::COMPILED {
-        return Ok((*parent).borrow_mut().add_new_compiled(session, &sym_name, &S!("")));
+        return Ok((*parent)
+            .borrow_mut()
+            .add_new_compiled(session, &sym_name, &S!("")));
     }
     // ROOT, NAMESPACE, PACKAGE or DISK_DIR: we can search on disk
     let paths = (*parent).borrow().paths().clone();
@@ -420,8 +613,10 @@ fn resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, im
                 full_path = full_path.join(imported_name.to_string());
             }
         }
-        if is_dir_cs(full_path.sanitize()) && (is_file_cs(full_path.join("__init__").with_extension("py").sanitize()) ||
-        is_file_cs(full_path.join("__init__").with_extension("pyi").sanitize())) {
+        if is_dir_cs(full_path.sanitize())
+            && (is_file_cs(full_path.join("__init__").with_extension("py").sanitize())
+                || is_file_cs(full_path.join("__init__").with_extension("pyi").sanitize()))
+        {
             //module directory
             let _rc_symbol = Symbol::create_from_path(session, &full_path, parent.clone(), false);
             if _rc_symbol.is_some() {
@@ -430,14 +625,24 @@ fn resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, im
                 return Ok(_arc_symbol);
             }
         } else if is_file_cs(full_path.with_extension("py").sanitize()) {
-            let _arc_symbol = Symbol::create_from_path(session, &full_path.with_extension("py"), parent.clone(), false);
+            let _arc_symbol = Symbol::create_from_path(
+                session,
+                &full_path.with_extension("py"),
+                parent.clone(),
+                false,
+            );
             if _arc_symbol.is_some() {
                 let _arc_symbol = _arc_symbol.unwrap();
                 SyncOdoo::build_now(session, &_arc_symbol, BuildSteps::ARCH);
                 return Ok(_arc_symbol);
             }
         } else if is_file_cs(full_path.with_extension("pyi").sanitize()) {
-            let _arc_symbol = Symbol::create_from_path(session, &full_path.with_extension("pyi"), parent.clone(), false);
+            let _arc_symbol = Symbol::create_from_path(
+                session,
+                &full_path.with_extension("pyi"),
+                parent.clone(),
+                false,
+            );
             if _arc_symbol.is_some() {
                 let _arc_symbol = _arc_symbol.unwrap();
                 SyncOdoo::build_now(session, &_arc_symbol, BuildSteps::ARCH);
@@ -453,65 +658,111 @@ fn resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, im
             }
         } else if !matches!(parent.borrow().typ(), SymType::ROOT) {
             if cfg!(target_os = "windows") {
-                for entry in glob((full_path.sanitize() + "*.pyd").as_str()).expect("Failed to read glob pattern") {
+                for entry in glob((full_path.sanitize() + "*.pyd").as_str())
+                    .expect("Failed to read glob pattern")
+                {
                     match entry {
                         Ok(_path) => {
-                            return Ok((*parent).borrow_mut().add_new_compiled(session, &sym_name, &_path.to_str().unwrap().to_string()));
+                            return Ok((*parent).borrow_mut().add_new_compiled(
+                                session,
+                                &sym_name,
+                                &_path.to_str().unwrap().to_string(),
+                            ));
                         }
-                        Err(_) => {},
+                        Err(_) => {}
                     }
                 }
             } else if cfg!(target_os = "linux") {
-                for entry in glob((full_path.sanitize() + "*.so").as_str()).expect("Failed to read glob pattern") {
+                for entry in glob((full_path.sanitize() + "*.so").as_str())
+                    .expect("Failed to read glob pattern")
+                {
                     match entry {
                         Ok(_path) => {
-                            return Ok((*parent).borrow_mut().add_new_compiled(session, &sym_name, &_path.to_str().unwrap().to_string()));
+                            return Ok((*parent).borrow_mut().add_new_compiled(
+                                session,
+                                &sym_name,
+                                &_path.to_str().unwrap().to_string(),
+                            ));
                         }
-                        Err(_) => {},
+                        Err(_) => {}
                     }
                 }
             }
         }
     }
-    return Err("Symbol not found".to_string())
+    return Err("Symbol not found".to_string());
 }
 
 /*
 Used for autocompletion. Given a base_name, return all valid names that can be used to complete it.
 is_from indicates if the completion item is the X in "from X import Y". Else it is Y from "import Y" or "from X import Y"
 */
-pub fn get_all_valid_names(session: &mut SessionInfo, source_file_symbol: &Rc<RefCell<Symbol>>, from_stmt: Option<String>, import: String, level: u32, is_from: bool) -> HashMap<OYarn, SymType> {
+pub fn get_all_valid_names(
+    session: &mut SessionInfo,
+    source_file_symbol: &Rc<RefCell<Symbol>>,
+    from_stmt: Option<String>,
+    import: String,
+    level: u32,
+    is_from: bool,
+) -> HashMap<OYarn, SymType> {
     let (identifier_from, to_complete) = match from_stmt {
         Some(from_stmt_inner) => {
             if is_from {
                 let split = from_stmt_inner.split(".").collect::<Vec<&str>>();
                 if split.len() > 1 {
-                    (Some(Identifier::new(split[0..split.len()-1].join(".").as_str(), TextRange::default())), split.last().unwrap().to_string())
+                    (
+                        Some(Identifier::new(
+                            split[0..split.len() - 1].join(".").as_str(),
+                            TextRange::default(),
+                        )),
+                        split.last().unwrap().to_string(),
+                    )
                 } else {
                     (None, split.last().unwrap().to_string())
                 }
             } else {
-                (Some(Identifier::new(from_stmt_inner.clone(), TextRange::default())), import.clone())
+                (
+                    Some(Identifier::new(
+                        from_stmt_inner.clone(),
+                        TextRange::default(),
+                    )),
+                    import.clone(),
+                )
             }
-        },
+        }
         None => (None, import.split(".").last().unwrap().to_string()),
     };
-    let source_root = source_file_symbol.borrow().get_root().as_ref().unwrap().upgrade().unwrap();
+    let source_root = source_file_symbol
+        .borrow()
+        .get_root()
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .unwrap();
     let entry = source_root.borrow().get_entry().unwrap();
-    let (mut from_symbol, _fallback_sym, file_tree) = resolve_from_stmt(session, source_file_symbol, identifier_from.as_ref(), level);
+    let (mut from_symbol, _fallback_sym, file_tree) =
+        resolve_from_stmt(session, source_file_symbol, identifier_from.as_ref(), level);
     let source_path = source_file_symbol.borrow().paths()[0].clone();
     let mut result = HashMap::new();
     let mut symbols_to_browse = vec![];
     if from_symbol.is_none() {
-        if !file_tree.is_empty() { //symbol was not found
+        if !file_tree.is_empty() {
+            //symbol was not found
             return result;
-        } else { //nothing was provided, so we have to add the root symbol of any valid entrypoint
+        } else {
+            //nothing was provided, so we have to add the root symbol of any valid entrypoint
             let entry_point_mgr = session.sync_odoo.entry_point_mgr.clone();
             let entry_point_mgr = entry_point_mgr.borrow();
-            let from_path = session.sync_odoo.entry_point_mgr.borrow().transform_addon_path(&PathBuf::from(source_path.clone()));
+            let from_path = session
+                .sync_odoo
+                .entry_point_mgr
+                .borrow()
+                .transform_addon_path(&PathBuf::from(source_path.clone()));
             let from_path = PathBuf::from(from_path);
             for entry in entry_point_mgr.iter_for_import(&entry) {
-                if (entry.borrow().is_public() && (level == 0)) || entry.borrow().is_valid_for(&from_path) {
+                if (entry.borrow().is_public() && (level == 0))
+                    || entry.borrow().is_valid_for(&from_path)
+                {
                     let entry_point = entry.borrow().get_symbol();
                     if let Some(entry_point) = entry_point {
                         symbols_to_browse.push(entry_point.clone());
@@ -528,7 +779,12 @@ pub fn get_all_valid_names(session: &mut SessionInfo, source_file_symbol: &Rc<Re
             symbols_to_browse.extend(fs);
         }
         for symbol_to_browse in symbols_to_browse.iter() {
-            let valid_names = valid_names_for_a_symbol(session, symbol_to_browse, &oyarn!("{}", to_complete), true);
+            let valid_names = valid_names_for_a_symbol(
+                session,
+                symbol_to_browse,
+                &oyarn!("{}", to_complete),
+                true,
+            );
             result.extend(valid_names);
         }
         return result;
@@ -541,7 +797,10 @@ pub fn get_all_valid_names(session: &mut SessionInfo, source_file_symbol: &Rc<Re
             &entry,
             source_path.as_str(),
             from_symbol.clone(),
-            &import_parts[0..import_parts.len()-1].iter().map(|s| oyarn!("{}", *s)).collect(),
+            &import_parts[0..import_parts.len() - 1]
+                .iter()
+                .map(|s| oyarn!("{}", *s))
+                .collect(),
             None,
             level,
         );
@@ -555,13 +814,19 @@ pub fn get_all_valid_names(session: &mut SessionInfo, source_file_symbol: &Rc<Re
         symbols_to_browse.extend(fs);
     }
     for symbol_to_browse in symbols_to_browse.iter() {
-        let valid_names = valid_names_for_a_symbol(session, symbol_to_browse, &oyarn!("{}", to_complete), false);
+        let valid_names =
+            valid_names_for_a_symbol(session, symbol_to_browse, &oyarn!("{}", to_complete), false);
         result.extend(valid_names);
     }
     result
 }
 
-fn valid_names_for_a_symbol(_session: &mut SessionInfo, symbol: &Rc<RefCell<Symbol>>, start_filter: &OYarn, only_on_disk: bool) -> HashMap<OYarn, SymType> {
+fn valid_names_for_a_symbol(
+    _session: &mut SessionInfo,
+    symbol: &Rc<RefCell<Symbol>>,
+    start_filter: &OYarn,
+    only_on_disk: bool,
+) -> HashMap<OYarn, SymType> {
     let mut res = HashMap::new();
     match symbol.borrow().typ() {
         SymType::FILE => {
@@ -569,12 +834,12 @@ fn valid_names_for_a_symbol(_session: &mut SessionInfo, symbol: &Rc<RefCell<Symb
                 return res;
             }
             res.extend(valid_name_from_symbol(symbol, start_filter));
-        },
+        }
         SymType::NAMESPACE | SymType::DISK_DIR => {
             for path in symbol.borrow().paths().iter() {
                 res.extend(valid_name_from_disk(path, start_filter));
             }
-        },
+        }
         SymType::PACKAGE(_) => {
             for path in symbol.borrow().paths().iter() {
                 res.extend(valid_name_from_disk(path, start_filter));
@@ -584,8 +849,13 @@ fn valid_names_for_a_symbol(_session: &mut SessionInfo, symbol: &Rc<RefCell<Symb
             }
             res.extend(valid_name_from_symbol(symbol, start_filter));
         }
-        SymType::CLASS | SymType::COMPILED | SymType::CSV_FILE | SymType::XML_FILE | SymType::FUNCTION | SymType::ROOT | SymType::VARIABLE => {
-        }
+        SymType::CLASS
+        | SymType::COMPILED
+        | SymType::CSV_FILE
+        | SymType::XML_FILE
+        | SymType::FUNCTION
+        | SymType::ROOT
+        | SymType::VARIABLE => {}
     }
     res
 }
@@ -594,17 +864,63 @@ fn valid_name_from_disk(path: &String, start_filter: &OYarn) -> HashMap<OYarn, S
     let mut res = HashMap::new();
     if is_dir_cs(path.clone()) {
         if let Ok(entries) = std::fs::read_dir(path) {
+            let mut visited_targets: HashSet<PathBuf> = HashSet::new();
             for entry in entries {
                 if let Ok(entry) = entry {
                     let Ok(file_type) = entry.file_type() else {
                         continue;
                     };
+                    if file_type.is_symlink() {
+                        let entry_path = entry.path();
+                        let Ok(canonical_path) = fs::canonicalize(&entry_path) else {
+                            continue;
+                        };
+                        if !visited_targets.insert(canonical_path.clone()) {
+                            continue;
+                        }
+                        let Ok(target_meta) = fs::metadata(&canonical_path) else {
+                            continue;
+                        };
+                        if target_meta.is_dir() {
+                            let dir_name = entry.file_name();
+                            let dir_name_str = dir_name.to_string_lossy();
+                            if dir_name_str.starts_with(start_filter.as_str()) {
+                                let mut typ = SymType::NAMESPACE;
+                                if canonical_path.join("__init__.py").exists() {
+                                    typ = SymType::PACKAGE(PackageType::PYTHON_PACKAGE);
+                                }
+                                res.insert(Sy!(dir_name_str.to_string()), typ);
+                            }
+                        } else if target_meta.is_file() {
+                            let file_name = entry.file_name();
+                            let file_name_str = file_name.to_string_lossy().to_string();
+                            if (file_name_str.ends_with(".py") || file_name_str.ends_with(".pyi"))
+                                && file_name_str.starts_with(start_filter.as_str())
+                            {
+                                let Some(stem) = Path::new(&file_name_str).file_stem() else {
+                                    continue;
+                                };
+                                let Some(filename) = stem.to_str() else {
+                                    continue;
+                                };
+                                if filename == "__init__" {
+                                    continue;
+                                }
+                                res.insert(Sy!(filename.to_string()), SymType::FILE);
+                            }
+                        }
+                        continue;
+                    }
                     if file_type.is_dir() {
                         let dir_name = entry.file_name();
                         let dir_name_str = dir_name.to_string_lossy();
                         if dir_name_str.starts_with(start_filter.as_str()) {
                             let mut typ = SymType::NAMESPACE;
-                            if Path::new(&path).join(dir_name_str.to_string()).join("__init__.py").exists() {
+                            if Path::new(&path)
+                                .join(dir_name_str.to_string())
+                                .join("__init__.py")
+                                .exists()
+                            {
                                 typ = SymType::PACKAGE(PackageType::PYTHON_PACKAGE);
                             }
                             res.insert(Sy!(dir_name_str.to_string()), typ);
@@ -612,14 +928,21 @@ fn valid_name_from_disk(path: &String, start_filter: &OYarn) -> HashMap<OYarn, S
                     } else if file_type.is_file() {
                         let file_name = entry.file_name();
                         let file_name_str = file_name.to_string_lossy().to_string();
-                        if (file_name_str.ends_with(".py") || file_name_str.ends_with(".pyi")) && file_name_str.starts_with(start_filter.as_str()) {
-                            let Some(stem) = Path::new(&file_name_str).file_stem() else {continue};
-                            let Some(filename) = stem.to_str() else {continue};
-                            if filename == "__init__" {continue;}
+                        if (file_name_str.ends_with(".py") || file_name_str.ends_with(".pyi"))
+                            && file_name_str.starts_with(start_filter.as_str())
+                        {
+                            let Some(stem) = Path::new(&file_name_str).file_stem() else {
+                                continue;
+                            };
+                            let Some(filename) = stem.to_str() else {
+                                continue;
+                            };
+                            if filename == "__init__" {
+                                continue;
+                            }
                             res.insert(Sy!(filename.to_string()), SymType::FILE);
                         }
                     }
-                    //TODO support for symlinks?
                 }
             }
         }
@@ -627,7 +950,10 @@ fn valid_name_from_disk(path: &String, start_filter: &OYarn) -> HashMap<OYarn, S
     res
 }
 
-fn valid_name_from_symbol(symbol: &Rc<RefCell<Symbol>>, start_filter: &OYarn) -> HashMap<OYarn, SymType> {
+fn valid_name_from_symbol(
+    symbol: &Rc<RefCell<Symbol>>,
+    start_filter: &OYarn,
+) -> HashMap<OYarn, SymType> {
     let mut res = HashMap::new();
     let symbols = symbol.borrow();
     for s in symbols.iter_symbols() {
